@@ -26,8 +26,8 @@ import sys
 
 ANDROID_NDK_ENVVARS = ['ANDROID_NDK_HOME', 'ANDROID_NDK']
 
-# Legacy NDKs + modern LLVM based NDK r23.
-ANDROID_NDK_SUPPORTED = [10, 19, 20, 23]
+# Legacy NDKs + modern LLVM based NDK r27.
+ANDROID_NDK_SUPPORTED = [10, 19, 20, 27]
 
 ANDROID_NDK_HARDFP_MAX = 11
 ANDROID_NDK_GCC_MAX = 17
@@ -39,7 +39,7 @@ ANDROID_NDK_API_MIN = {
 	10: 3,
 	19: 16,
 	20: 16,
-	23: 21
+	27: 21
 }
 
 ANDROID_64BIT_API_MIN = 21
@@ -124,7 +124,7 @@ class Android:
 		else:
 			self.ndk_rev = ANDROID_NDK_SUPPORTED[0]
 
-		# NDK r18+ is Clang based, and r23 is LLVM-only.
+		# NDK r18+ is Clang based, and r27 is LLVM-only.
 		if 'clang' in self.toolchain or self.ndk_rev > ANDROID_NDK_GCC_MAX:
 			self.clang = True
 
@@ -240,7 +240,7 @@ class Android:
 		'''
 		Return the root of the NDK toolchain.
 
-		Modern NDKs including r23 have only the LLVM toolchain:
+		Modern NDKs including r27 have only the LLVM toolchain:
 
 		    toolchains/llvm/prebuilt/linux-x86_64
 
@@ -250,7 +250,7 @@ class Android:
 		path = 'toolchains'
 		toolchain_host = self.gen_host_toolchain()
 
-		if self.ndk_rev >= 23:
+		if self.ndk_rev >= 27:
 			toolchain_folder = 'llvm'
 
 		elif self.is_clang():
@@ -312,11 +312,11 @@ class Android:
 		Use the compiler shipped with the NDK.
 
 		The old implementation used the system 'clang' for --android=...,host,...
-		which is undesirable with modern NDKs. r23's clang lives in the LLVM
+		which is undesirable with modern NDKs. r27's clang lives in the LLVM
 		toolchain itself.
 		'''
 
-		if self.ndk_rev >= 23:
+		if self.ndk_rev >= 27:
 			return _ensure_executable(self.gen_toolchain_path() + 'clang')
 
 		if self.is_host():
@@ -330,7 +330,7 @@ class Android:
 		)
 
 	def cxx(self):
-		if self.ndk_rev >= 23:
+		if self.ndk_rev >= 27:
 			return _ensure_executable(self.gen_toolchain_path() + 'clang++')
 
 		if self.is_host():
@@ -344,7 +344,7 @@ class Android:
 		)
 
 	def strip(self):
-		if self.ndk_rev >= 23:
+		if self.ndk_rev >= 27:
 			return _ensure_executable(
 				os.path.join(
 					self.gen_gcc_toolchain_path(),
@@ -368,10 +368,10 @@ class Android:
 		Legacy Android support headers.
 
 		Modern NDKs don't contain the old android/support include tree,
-		so don't inject it for r23.
+		so don't inject it for r27.
 		'''
 
-		if self.ndk_rev >= 23:
+		if self.ndk_rev >= 27:
 			return []
 
 		return [
@@ -429,7 +429,7 @@ class Android:
 
 		# NDK r20 and earlier had special handling for the host compiler.
 		# Modern NDK clang already knows its unified sysroot.
-		elif self.ndk_rev < 23 and self.is_host():
+		elif self.ndk_rev < 27 and self.is_host():
 			cflags += [
 				'--sysroot=%s/sysroot' % (
 					self.gen_gcc_toolchain_path()
@@ -438,7 +438,7 @@ class Android:
 				'%s/usr/include/' % self.sysroot()
 			]
 
-		# r23:
+		# r27:
 		#
 		# Do not manually specify the libc++ include directory here.
 		# The NDK clang driver automatically adds:
@@ -527,7 +527,7 @@ class Android:
 		linkflags = []
 
 		# The modern NDK clang driver does not need a GCC toolchain.
-		if self.is_host() and self.ndk_rev < 23:
+		if self.is_host() and self.ndk_rev < 27:
 			linkflags += [
 				'--gcc-toolchain=%s' %
 				self.gen_gcc_toolchain_path()
@@ -538,7 +538,7 @@ class Android:
 				'--sysroot=%s' % self.sysroot()
 			]
 
-		elif self.is_host() and self.ndk_rev < 23:
+		elif self.is_host() and self.ndk_rev < 27:
 			linkflags += [
 				'--sysroot=%s/sysroot' %
 				self.gen_gcc_toolchain_path()
@@ -567,8 +567,8 @@ class Android:
 				'-lgcc'
 			]
 
-		# NDK r23 uses libc++, not GNU libstdc++.
-		if self.ndk_rev >= 23:
+		# NDK r27 uses libc++, not GNU libstdc++.
+		if self.ndk_rev >= 27:
 			ldflags += [
 				'-stdlib=libc++'
 			]
@@ -682,13 +682,13 @@ def configure(conf):
 		#   gnu-libstdc++/4.9
 		#   libgnustl_static
 		#
-		# Modern NDK r23:
+		# Modern NDK r27:
 		#   libc++
 		#
-		# Do NOT reference the removed GNU STL directories in r23.
+		# Do NOT reference the removed GNU STL directories in r27.
 		#
 
-		if android.ndk_rev >= 23:
+		if android.ndk_rev >= 27:
 
 			# clang's libc++ headers are provided by the LLVM
 			# toolchain/sysroot. Don't add the removed
