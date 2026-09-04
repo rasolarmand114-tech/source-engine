@@ -12,7 +12,7 @@ export NDK_HOME="$PWD/android-ndk-r27d"
 
 ./waf configure \
     configure -T release \
-    --build-games=csso \
+    --build-games=cstrike \
     --togles \
     --android=aarch64,host,21 \
     --prefix=./output \
