@@ -12,6 +12,8 @@
 #include "appframework/ilaunchermgr.h"
 #include "inputsystem/ButtonCode.h"
 
+#include "public/togles/linuxwin/glentrypoints.h"
+
 #include "togl/rendermechanism.h"
 
 #include "tier0/vprof_telemetry.h"
@@ -20,7 +22,7 @@
 #include "tier1/utllinkedlist.h"
 #include "tier1/convar.h"
 #ifdef TOGLES
-#include "../togles/linuxwin/glentrypoints.h"
+
 #include <EGL/egl.h>
 #endif
 
