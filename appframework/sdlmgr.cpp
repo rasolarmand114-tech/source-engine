@@ -20,6 +20,7 @@
 #include "tier1/utllinkedlist.h"
 #include "tier1/convar.h"
 #ifdef TOGLES
+#include "../togles/linuxwin/glentrypoints.h"
 #include <EGL/egl.h>
 #endif
 
