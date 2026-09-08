@@ -34,7 +34,7 @@ extern "C" {
 
 #include "tier0/icommandline.h"
 #include "glmtexinlines.h"
-#include "astc_texcompress.h"	
+#include "astc_texcompress.h"		// added: ASTC LDR/HDR runtime recompression for ARGB/RGBA formats
 
 // memdbgon -must- be the last include file in a .cpp file.
 #include "tier0/memdbgon.h"
@@ -125,7 +125,8 @@ const GLMTexFormatDesc g_formatDescTable[] =
 	{ "_DXT1",			D3DFMT_DXT1,			GL_COMPRESSED_RGB_S3TC_DXT1_EXT,	GL_COMPRESSED_SRGB_S3TC_DXT1_EXT,		GL_RGB,				GL_UNSIGNED_BYTE,				4, 8 },
 	{ "_DXT3",			D3DFMT_DXT3,			GL_COMPRESSED_RGBA_S3TC_DXT3_EXT,	GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT,	GL_RGBA,			GL_UNSIGNED_BYTE,				4, 16 },
 	{ "_DXT5",			D3DFMT_DXT5,			GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,	GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT,	GL_RGBA,			GL_UNSIGNED_BYTE,				4, 16 },
-// --- ASTC (added) -------------------------------------------------------
+
+	// --- ASTC (added) -------------------------------------------------------
 	// These two rows describe textures that are ALREADY stored as ASTC (e.g. a
 	// pre-baked .vtf payload) and just pass through to GL as-is.
 	// D3DFMT_ASTC_LDR_4x4 / D3DFMT_ASTC_HDR_6x6 are new FOURCC-style format
@@ -140,8 +141,6 @@ const GLMTexFormatDesc g_formatDescTable[] =
 	{ "_ASTC_LDR_4x4",	D3DFMT_ASTC_LDR_4x4,	GL_COMPRESSED_RGBA_ASTC_4x4_KHR,	GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,	GL_RGBA,	GL_UNSIGNED_BYTE,				4, 16 },	// ASTC LDR profile
 	{ "_ASTC_HDR_6x6",	D3DFMT_ASTC_HDR_6x6,	GL_COMPRESSED_RGBA_ASTC_6x6_KHR,	0,											GL_RGBA,	GL_UNSIGNED_BYTE,				6, 16 },	// ASTC HDR profile (needs GL_KHR_texture_compression_astc_hdr)
 
- 	{ "_A16B16G16R16F",	D3DFMT_A16B16G16R16F,	GL_RGBA16F_ARB,						0,									GL_RGBA,				GL_HALF_FLOAT_ARB,				1, 8 },
- 	{ "_A16B16G16R16",	D3DFMT_A16B16G16R16,	GL_RGBA16,							0,									GL_RGBA,				GL_UNSIGNED_SHORT,				1, 8 },		// 16bpc integer tex
 	{ "_A16B16G16R16F",	D3DFMT_A16B16G16R16F,	GL_RGBA16F_ARB,						0,									GL_RGBA,				GL_HALF_FLOAT_ARB,				1, 8 },
 	{ "_A16B16G16R16",	D3DFMT_A16B16G16R16,	GL_RGBA16,							0,									GL_RGBA,				GL_UNSIGNED_SHORT,				1, 8 },		// 16bpc integer tex
 
@@ -3731,8 +3730,9 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				}
 				else
 				{					
-					 // uncompressed path -- OR runtime ASTC recompression (added)
+					// uncompressed path -- OR runtime ASTC recompression (added)
 					// http://www.opengl.org/documentation/specs/man_pages/hardcopy/GL/html/gl/teximage2d.html
+
 					bool bDidASTC = false;
 
 					// Opt-in: re-encode this ARGB/RGBA upload into ASTC (LDR or HDR,
@@ -3758,7 +3758,7 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 												   &astcResult ) )
 						{
 							// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
-						gGL->glCompressedTexImage2D( target, desc->m_req.m_mip,
+							gGL->glCompressedTexImage2D( target, desc->m_req.m_mip,
 														  (GLenum)astcResult.m_glInternalFormat,
 														  slice->m_xSize, slice->m_ySize, 0,
 														  astcResult.m_nDataSize, astcResult.m_pData );
@@ -3770,7 +3770,7 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 					}
 
 					if ( !bDidASTC )
-				{
+					{
 					convert_texture(intformat, m_layout->m_slices[ desc->m_sliceIndex ].m_xSize, m_layout->m_slices[ desc->m_sliceIndex ].m_ySize, glDataFormat, glDataType, noDataWrite ? NULL : sliceAddress);
 					
 					gGL->glTexImage2D(			target,						// target
@@ -3782,6 +3782,7 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 											glDataFormat,				// dataformat
 											glDataType,					// datatype
 											noDataWrite ? NULL : sliceAddress );	// data (optionally suppressed in case ResetSRGB desires)
+					}
 
 					if (m_layout->m_key.m_texFlags & kGLMTexMultisampled)
 					{
