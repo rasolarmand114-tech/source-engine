@@ -67,7 +67,7 @@
 #define GL_COMPRESSED_RGBA_ASTC_10x10_KHR  0x93BB
 #define GL_COMPRESSED_RGBA_ASTC_12x10_KHR  0x93BC
 #define GL_COMPRESSED_RGBA_ASTC_12x12_KHR  0x93BD
-// sRGB variants (LDR-only; there is no sRGBHDR combination in the spec)
+// sRGB variants (LDR-only; there is no sRGB+HDR combination in the spec)
 #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR   0x93D0
 #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR   0x93D1
 #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR   0x93D2
@@ -96,7 +96,7 @@ struct ASTCEncodeResult
 	uint32_t	m_glInternalFormat;	// GL_COMPRESSED_RGBA_ASTC_WxH_KHR to pass to glCompressedTexImage2D
 	int			m_blockW;
 	int			m_blockH;
-	EASTCProfile m_profile;			// LDR or HDR -- informational, also implied by m_glInternalFormat  profile used to encode
+	EASTCProfile m_profile;			// LDR or HDR -- informational, also implied by m_glInternalFormat + profile used to encode
 };
 
 // Returns true if this D3DFORMAT is one of the "RGBA family" formats this
