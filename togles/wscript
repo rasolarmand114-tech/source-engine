@@ -25,7 +25,8 @@ def build(bld):
 		'linuxwin/glmgrbasics.cpp',	
 		#'linuxwin/intelglmallocworkaround.cpp',		[$OSXALL]
 		#'linuxwin/mach_override.c',					[$OSXALL]
-		'linuxwin/cglmtex.cpp',		
+		'linuxwin/cglmtex.cpp',	
+        'linuxwin/astc_texcompress.cpp',	
 		'linuxwin/cglmfbo.cpp',		
 		'linuxwin/cglmprogram.cpp',	
 		'linuxwin/cglmbuffer.cpp',	
