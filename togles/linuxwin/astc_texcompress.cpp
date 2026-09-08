@@ -197,7 +197,7 @@ static float HalfToFloat( uint16_t h )
 			exp = 1;
 			while ( !(mant & 0x400) ) { mant <<= 1; exp--; }
 			mant &= 0x3FF;
-			bits = sign | ((exp  112) << 23) | (mant << 13);
+			bits = sign | ((exp + 112) << 23) | (mant << 13);
 		}
 	}
 	else if ( exp == 31 )
@@ -206,7 +206,7 @@ static float HalfToFloat( uint16_t h )
 	}
 	else
 	{
-		bits = sign | ((exp  112) << 23) | (mant << 13);
+		bits = sign | ((exp + 112) << 23) | (mant << 13);
 	}
 	float f;
 	memcpy( &f, &bits, sizeof(f) );
@@ -226,14 +226,14 @@ static void* BuildRGBABuffer( const void* srcData, int width, int height,
 		uint8_t* dst = (uint8_t*)malloc( (size_t)nPixels * 4 );
 		const uint8_t* src8 = (const uint8_t*)srcData;
 
-		for ( int i = 0; i < nPixels; i )
+		for ( int i = 0; i < nPixels; ++i )
 		{
 			uint8_t r, g, b, a;
 			if ( glType == GL_UNSIGNED_INT_8_8_8_8_REV )
 			{
 				uint32_t texel = ((const uint32_t*)srcData)[i];
 				// D3D/GL "REV" packing: byte order in memory is B,G,R,A for
-				// GL_BGRA  UNSIGNED_INT_8_8_8_8_REV (matches _A8R8G8B8 etc.)
+				// GL_BGRA + UNSIGNED_INT_8_8_8_8_REV (matches _A8R8G8B8 etc.)
 				b = (texel      ) & 0xFF;
 				g = (texel >>  8) & 0xFF;
 				r = (texel >> 16) & 0xFF;
@@ -244,14 +244,14 @@ static void* BuildRGBABuffer( const void* srcData, int width, int height,
 				int base = i * 4;
 				if ( glFormat == GL_BGRA )
 				{
-					b = src8[base0]; g = src8[base1]; r = src8[base2]; a = src8[base3];
+					b = src8[base+0]; g = src8[base+1]; r = src8[base+2]; a = src8[base+3];
 				}
 				else // GL_RGBA
 				{
-					r = src8[base0]; g = src8[base1]; b = src8[base2]; a = src8[base3];
+					r = src8[base+0]; g = src8[base+1]; b = src8[base+2]; a = src8[base+3];
 				}
 			}
-			dst[i*40] = r; dst[i*41] = g; dst[i*42] = b; dst[i*43] = a;
+			dst[i*4+0] = r; dst[i*4+1] = g; dst[i*4+2] = b; dst[i*4+3] = a;
 		}
 		return dst;
 	}
@@ -262,12 +262,12 @@ static void* BuildRGBABuffer( const void* srcData, int width, int height,
 		if ( glType == GL_HALF_FLOAT_ARB )
 		{
 			const uint16_t* src16 = (const uint16_t*)srcData;
-			for ( int i = 0; i < nPixels; i )
+			for ( int i = 0; i < nPixels; ++i )
 			{
-				dst[i*40] = HalfToFloat( src16[i*40] );
-				dst[i*41] = HalfToFloat( src16[i*41] );
-				dst[i*42] = HalfToFloat( src16[i*42] );
-				dst[i*43] = HalfToFloat( src16[i*43] );
+				dst[i*4+0] = HalfToFloat( src16[i*4+0] );
+				dst[i*4+1] = HalfToFloat( src16[i*4+1] );
+				dst[i*4+2] = HalfToFloat( src16[i*4+2] );
+				dst[i*4+3] = HalfToFloat( src16[i*4+3] );
 			}
 		}
 		else // GL_FLOAT
@@ -345,8 +345,8 @@ bool ASTC_CompressTexture(
 
 	astcenc_swizzle swizzle { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
 
-	int xBlocks = (width   blockW - 1) / blockW;
-	int yBlocks = (height  blockH - 1) / blockH;
+	int xBlocks = (width  + blockW - 1) / blockW;
+	int yBlocks = (height + blockH - 1) / blockH;
 	size_t compSize = (size_t)xBlocks * yBlocks * 16; // ASTC blocks are always 16 bytes
 
 	uint8_t* compData = (uint8_t*)malloc( compSize );
