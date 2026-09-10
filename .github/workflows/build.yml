@@ -14,11 +14,16 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
+      - name: Prepare dependencies + fetch tags
+        run: |
+          sudo apt update -y
+          sudo apt install -y \
+            astcenc libastcenc-dev
 
       - name: Build android-aarch64
         run: |
-          chmod +x scripts/build-android-arm64.sh
-          scripts/build-android-arm64.sh
+          chmod +x scripts/build-android-aarch64.sh
+          scripts/build-android-aarch64.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
