@@ -19,7 +19,6 @@ CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-s -flto"
     configure -T release \
     --build-games=cstrike \
     --togles \
-    --DHAVE_ASTCENC=1 \
     --android=aarch64,host,21 \
     --prefix=./output \
     --disable-warns \
