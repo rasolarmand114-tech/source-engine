@@ -3667,10 +3667,43 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				Assert( writeWholeSlice );	//subimage not implemented in this path yet
 				// compressed path
 				// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
-				if( gGL->m_bHave_GL_EXT_texture_compression_dxt1 )
-					gGL->glCompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
-				else
-					CompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
+
+				bool bDidDXTToASTC = false;
+
+				// MANDATORY: an already-DXT1/3/5-compressed source is
+				// decompressed and re-encoded as ASTC too, so every texture
+				// -- not just the uncompressed ones -- ends up ASTC. Skipped
+				// for render targets/multisampled for the same hardware
+				// reason as the uncompressed path below, plus non-4-multiple
+				// dimensions (tiny mips) where decompression isn't safe.
+				if ( !gl_astc_debug_disable.GetBool()
+					&& sliceAddress != NULL
+					&& !(m_layout->m_key.m_texFlags & (kGLMTexMultisampled|kGLMTexRenderable))
+					&& ASTC_IsDXTFormat( (int)m_layout->m_key.m_texFormat ) )
+				{
+					ASTCEncodeResult astcResult;
+					if ( ASTC_CompressDXTToASTC( sliceAddress, slice->m_xSize, slice->m_ySize,
+												  (int)m_layout->m_key.m_texFormat,
+												  gl_astc_quality.GetInt(), &astcResult ) )
+					{
+						gGL->glCompressedTexImage2D( target, desc->m_req.m_mip,
+													  (GLenum)astcResult.m_glInternalFormat,
+													  slice->m_xSize, slice->m_ySize, 0,
+													  astcResult.m_nDataSize, astcResult.m_pData );
+						ASTC_FreeResult( &astcResult );
+						bDidDXTToASTC = true;
+					}
+					// else: astcenc unavailable, ragged mip, or encode failure --
+					// fall through and upload the original DXT bytes unchanged.
+				}
+
+				if ( !bDidDXTToASTC )
+				{
+					if( gGL->m_bHave_GL_EXT_texture_compression_dxt1 )
+						gGL->glCompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
+					else
+						CompressedTexImage2D( target, desc->m_req.m_mip, intformat, slice->m_xSize, slice->m_ySize, 0, slice->m_storageSize, sliceAddress );
+				}
 			}
 			else
 			{
@@ -3724,12 +3757,16 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 
 					bool bDidASTC = false;
 
-					// Opt-in: re-encode this ARGB/RGBA upload into ASTC (LDR or HDR,
-					// chosen automatically from the source D3DFORMAT) instead of
-					// pushing raw pixels to the GPU. Only applies to whole-slice,
-					// non-render-target, non-multisampled uploads that actually carry
-					// data -- render targets / subimage streaming stay uncompressed.
-					if ( gl_astc_recompress.GetBool()
+					// MANDATORY: every eligible uncompressed texture format is
+					// re-encoded to ASTC (LDR or HDR, chosen automatically from
+					// the source D3DFORMAT) instead of being pushed to the GPU
+					// as raw pixels. This is not opt-in -- gl_astc_debug_disable
+					// is a debug-only kill switch (default 0), not a normal
+					// toggle. Render targets / multisampled surfaces are the
+					// only formats skipped, because OpenGL cannot render into
+					// a compressed texture on any driver -- that's a hardware/
+					// API limitation, not a policy choice.
+					if ( !gl_astc_debug_disable.GetBool()
 						&& writeWholeSlice
 						&& !noDataWrite
 						&& sliceAddress != NULL
@@ -3754,8 +3791,10 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 							ASTC_FreeResult( &astcResult );
 							bDidASTC = true;
 						}
-						// else: encoder unavailable/failed -- silently fall through to
-						// the normal uncompressed path below so nothing ever breaks.
+						// else: astcenc not compiled in (HAVE_ASTCENC) or encoding
+						// failed -- fall through to the uncompressed path below.
+						// This is the only situation a texture doesn't end up as
+						// ASTC; it's a build-environment fallback, not a toggle.
 					}
 
 					if ( !bDidASTC )
@@ -3790,35 +3829,95 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 			
 		case GL_TEXTURE_3D:
 		{
+			bool bASTCEligible3D = !gl_astc_debug_disable.GetBool()
+				&& sliceAddress != NULL
+				&& !(m_layout->m_key.m_texFlags & (kGLMTexMultisampled|kGLMTexRenderable));
+
 			// check compressed or not
 			if (format->m_chunkSize != 1)
 			{
 				// compressed path
 				// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage3D.xml
-				
-				gGL->glCompressedTexImage3D(	target,						// target
-										desc->m_req.m_mip,			// level
-										intformat,					// internalformat
-										slice->m_xSize,				// width
-										slice->m_ySize,				// height
-										slice->m_zSize,				// depth
-										0,							// border
-										slice->m_storageSize,		// imageSize
-										sliceAddress );				// data
+
+				bool bDidDXTToASTC3D = false;
+
+				// MANDATORY, same as the 2D compressed path: an already-DXT-
+				// compressed volume texture is decompressed per Z-layer and
+				// re-encoded as ASTC via GL_KHR_texture_compression_astc_sliced_3d.
+				if ( bASTCEligible3D && ASTC_IsDXTFormat( (int)m_layout->m_key.m_texFormat ) )
+				{
+					ASTCEncodeResult astcResult;
+					if ( ASTC_CompressDXTToASTC3DSliced( sliceAddress, slice->m_xSize, slice->m_ySize,
+														  slice->m_zSize, (int)m_layout->m_key.m_texFormat,
+														  gl_astc_quality.GetInt(), &astcResult ) )
+					{
+						gGL->glCompressedTexImage3D( target, desc->m_req.m_mip,
+													  (GLenum)astcResult.m_glInternalFormat,
+													  slice->m_xSize, slice->m_ySize, slice->m_zSize, 0,
+													  astcResult.m_nDataSize, astcResult.m_pData );
+						ASTC_FreeResult( &astcResult );
+						bDidDXTToASTC3D = true;
+					}
+				}
+
+				if ( !bDidDXTToASTC3D )
+				{
+					gGL->glCompressedTexImage3D(	target,						// target
+											desc->m_req.m_mip,			// level
+											intformat,					// internalformat
+											slice->m_xSize,				// width
+											slice->m_ySize,				// height
+											slice->m_zSize,				// depth
+											0,							// border
+											slice->m_storageSize,		// imageSize
+											sliceAddress );				// data
+				}
 			}
 			else
 			{
-				convert_texture(intformat, m_layout->m_slices[ desc->m_sliceIndex ].m_xSize, m_layout->m_slices[ desc->m_sliceIndex ].m_ySize, glDataFormat, glDataType, noDataWrite ? NULL : sliceAddress);				
-				gGL->glTexImage3D(			target,						// target
-										desc->m_req.m_mip,			// level
-										intformat,					// internalformat
-										slice->m_xSize,				// width
-										slice->m_ySize,				// height
-										slice->m_zSize,				// depth
-										0,							// border
-										glDataFormat,				// dataformat
-										glDataType,					// datatype
-										noDataWrite ? NULL : sliceAddress );	// data (optionally suppressed in case ResetSRGB desires)
+				bool bDidASTC3D = false;
+
+				// MANDATORY, same as the 2D uncompressed path: any eligible
+				// uncompressed volume texture (e.g. a color-correction LUT)
+				// is re-encoded as ASTC via
+				// GL_KHR_texture_compression_astc_sliced_3d -- one ordinary
+				// 2D ASTC image per Z-layer, concatenated.
+				if ( bASTCEligible3D && !noDataWrite
+					&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat ) )
+				{
+					bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
+					int blockW, blockH;
+					ASTC_GetConfiguredBlockSize( isHDR, &blockW, &blockH );
+
+					ASTCEncodeResult astcResult;
+					if ( ASTC_CompressTexture3DSliced( sliceAddress, slice->m_xSize, slice->m_ySize,
+														slice->m_zSize, glDataFormat, glDataType, isHDR,
+														blockW, blockH, gl_astc_quality.GetInt(),
+														&astcResult ) )
+					{
+						gGL->glCompressedTexImage3D( target, desc->m_req.m_mip,
+													  (GLenum)astcResult.m_glInternalFormat,
+													  slice->m_xSize, slice->m_ySize, slice->m_zSize, 0,
+													  astcResult.m_nDataSize, astcResult.m_pData );
+						ASTC_FreeResult( &astcResult );
+						bDidASTC3D = true;
+					}
+				}
+
+				if ( !bDidASTC3D )
+				{
+					convert_texture(intformat, m_layout->m_slices[ desc->m_sliceIndex ].m_xSize, m_layout->m_slices[ desc->m_sliceIndex ].m_ySize, glDataFormat, glDataType, noDataWrite ? NULL : sliceAddress);				
+					gGL->glTexImage3D(			target,						// target
+											desc->m_req.m_mip,			// level
+											intformat,					// internalformat
+											slice->m_xSize,				// width
+											slice->m_ySize,				// height
+											slice->m_zSize,				// depth
+											0,							// border
+											glDataFormat,				// dataformat
+											glDataType,					// datatype
+											noDataWrite ? NULL : sliceAddress );	// data (optionally suppressed in case ResetSRGB desires)
+				}
 			}
 		}
 		break;
