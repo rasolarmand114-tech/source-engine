@@ -19,7 +19,7 @@ CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-s -flto"
     --build-games=cstrike \
     --togles \
     --android=aarch64,host,21 \
-    --prefix=./output \
+    --prefix=output \
     --disable-warns \
 
 ./waf build -j$(nproc)
