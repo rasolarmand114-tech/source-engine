@@ -46,6 +46,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "tier1/convar.h"	// needed for the extern ConVar declarations below (callers use .GetBool()/.GetInt()/.GetString())
 
 // ---------------------------------------------------------------------------
 // GL enums for ASTC (from KHR_texture_compression_astc_ldr / _hdr).
@@ -67,7 +68,7 @@
 #define GL_COMPRESSED_RGBA_ASTC_10x10_KHR  0x93BB
 #define GL_COMPRESSED_RGBA_ASTC_12x10_KHR  0x93BC
 #define GL_COMPRESSED_RGBA_ASTC_12x12_KHR  0x93BD
-// sRGB variants (LDR-only; there is no sRGBHDR combination in the spec)
+// sRGB variants (LDR-only; there is no sRGB+HDR combination in the spec)
 #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR   0x93D0
 #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR   0x93D1
 #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR   0x93D2
@@ -96,7 +97,7 @@ struct ASTCEncodeResult
 	uint32_t	m_glInternalFormat;	// GL_COMPRESSED_RGBA_ASTC_WxH_KHR to pass to glCompressedTexImage2D
 	int			m_blockW;
 	int			m_blockH;
-	EASTCProfile m_profile;			// LDR or HDR -- informational, also implied by m_glInternalFormat  profile used to encode
+	EASTCProfile m_profile;			// LDR or HDR -- informational, also implied by m_glInternalFormat + profile used to encode
 };
 
 // Returns true if this D3DFORMAT is one of the "RGBA family" formats this
@@ -144,10 +145,13 @@ void ASTC_FreeResult( ASTCEncodeResult* result );
 // dimensions for the given profile. Used by the WriteTexels upload hook.
 void ASTC_GetConfiguredBlockSize( bool isHDR, int* outW, int* outH );
 
-// Convars (defined in astc_texcompress.cpp):
-//   gl_astc_recompress   0/1 - master enable for this feature (default 0, opt-in)
-//   gl_astc_block_ldr    "4x4" / "5x5" / "6x6" / "8x8" ... - block size used for LDR (8-bit) sources
-//   gl_astc_block_hdr    "4x4" / "5x5" / "6x6" / "8x8" ... - block size used for HDR (float) sources
-//   gl_astc_quality      0-100 - encoder quality/speed tradeoff
+// Convars (defined in astc_texcompress.cpp). Declared extern here so any
+// other translation unit -- cglmtex.cpp included -- can reference them
+// after including this header; without this each .cpp only sees its own
+// copy and the linker/compiler has no idea gl_astc_recompress etc. exist.
+extern ConVar gl_astc_recompress;	// 0/1 - master enable for this feature (default 0, opt-in)
+extern ConVar gl_astc_block_ldr;	// "4x4" / "5x5" / "6x6" / "8x8" ... - block size used for LDR (8-bit) sources
+extern ConVar gl_astc_block_hdr;	// "4x4" / "5x5" / "6x6" / "8x8" ... - block size used for HDR (float) sources
+extern ConVar gl_astc_quality;		// 0-100 - encoder quality/speed tradeoff
 
 #endif // ASTC_TEXCOMPRESS_H
