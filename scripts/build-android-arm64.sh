@@ -16,7 +16,6 @@ chmod +x $HOME/llvm11/bin/llvm-strip
 export PATH=$HOME/llvm11/bin:$PATH
 CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-s -flto"
 ./waf configure \
-    configure -T release \
     --build-games=cstrike \
     --togles \
     --android=aarch64,host,21 \
