@@ -43,9 +43,8 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// ConVars
+// ConVars (declared extern in astc_texcompress.h so cglmtex.cpp etc. can see them)
 // ---------------------------------------------------------------------------
-#include "tier1/convar.h"
 
 ConVar gl_astc_recompress( "gl_astc_recompress", "0", FCVAR_ARCHIVE,
 	"If set, ARGB/RGBA textures are re-encoded to ASTC (LDR or HDR, chosen "
