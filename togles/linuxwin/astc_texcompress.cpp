@@ -84,8 +84,6 @@ bool ASTC_IsEligibleFormat( int d3dFormat )
 		case D3DFMT_X8R8G8B8:
 		case D3DFMT_Q8W8V8U8:
 		// GL_RGBA / GL_UNSIGNED_INT_10_10_10_2 and GL_BGRA variant (32-bit packed, non-REV)
-		case D3DFMT_A2R10G10B10:
-		case D3DFMT_A2B10G10R10:
 		// GL_BGRA / GL_UNSIGNED_SHORT_4_4_4_4_REV (16-bit packed)
 		case D3DFMT_A4R4G4B4:
 		// GL_BGRA / GL_UNSIGNED_SHORT_1_5_5_5_REV (16-bit packed)
