@@ -24,7 +24,7 @@
 //                                decode as regular UNORM colors. Used for
 //                                every normalized/byte format (_A8R8G8B8,
 //                                _X8R8G8B8, _R8G8B8, _R5G6B5, _A1R5G5B5,
-//                                _A4R4G4B4, _Q8W8V8U8, _A2R10G10B10,
+//                                _A4R4G4B4, _Q8W8V8U8,
 //                                _A16B16G16R16, _L8, _A8L8, _A8, _L16, ...)
 //                                and for decompressed DXT1/DXT3/DXT5 source
 //                                data.
