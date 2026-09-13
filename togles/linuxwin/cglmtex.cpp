@@ -3691,7 +3691,15 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 													  slice->m_xSize, slice->m_ySize, 0,
 													  astcResult.m_nDataSize, astcResult.m_pData );
 						ASTC_FreeResult( &astcResult );
-						bDidDXTToASTC = true;
+						// Some Android GPU drivers advertise the ASTC extensions but still
+						// reject a specific block size/profile (HDR and sliced-3D are far less
+						// mature across vendors than 2D LDR ASTC) -- confirm the upload actually
+						// took before trusting it, instead of leaving the texture undefined on
+						// the GPU. Drain the full error queue so a rejection here can never leak
+						// into an unrelated glGetError() check elsewhere in the engine.
+						bool bASTCUploadOK = true;
+						while ( gGL->glGetError() != GL_NO_ERROR ) { bASTCUploadOK = false; }
+						bDidDXTToASTC = bASTCUploadOK;
 					}
 					// else: astcenc unavailable, ragged mip, or encode failure --
 					// fall through and upload the original DXT bytes unchanged.
@@ -3789,7 +3797,15 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 														  slice->m_xSize, slice->m_ySize, 0,
 														  astcResult.m_nDataSize, astcResult.m_pData );
 							ASTC_FreeResult( &astcResult );
-							bDidASTC = true;
+							// Some Android GPU drivers advertise the ASTC extensions but still
+							// reject a specific block size/profile (HDR and sliced-3D are far less
+							// mature across vendors than 2D LDR ASTC) -- confirm the upload actually
+							// took before trusting it, instead of leaving the texture undefined on
+							// the GPU. Drain the full error queue so a rejection here can never leak
+							// into an unrelated glGetError() check elsewhere in the engine.
+							bool bASTCUploadOK = true;
+							while ( gGL->glGetError() != GL_NO_ERROR ) { bASTCUploadOK = false; }
+							bDidASTC = bASTCUploadOK;
 						}
 						// else: astcenc not compiled in (HAVE_ASTCENC) or encoding
 						// failed -- fall through to the uncompressed path below.
@@ -3856,7 +3872,15 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 													  slice->m_xSize, slice->m_ySize, slice->m_zSize, 0,
 													  astcResult.m_nDataSize, astcResult.m_pData );
 						ASTC_FreeResult( &astcResult );
-						bDidDXTToASTC3D = true;
+						// Some Android GPU drivers advertise the ASTC extensions but still
+						// reject a specific block size/profile (HDR and sliced-3D are far less
+						// mature across vendors than 2D LDR ASTC) -- confirm the upload actually
+						// took before trusting it, instead of leaving the texture undefined on
+						// the GPU. Drain the full error queue so a rejection here can never leak
+						// into an unrelated glGetError() check elsewhere in the engine.
+						bool bASTCUploadOK = true;
+						while ( gGL->glGetError() != GL_NO_ERROR ) { bASTCUploadOK = false; }
+						bDidDXTToASTC3D = bASTCUploadOK;
 					}
 				}
 
@@ -3900,7 +3924,15 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 													  slice->m_xSize, slice->m_ySize, slice->m_zSize, 0,
 													  astcResult.m_nDataSize, astcResult.m_pData );
 						ASTC_FreeResult( &astcResult );
-						bDidASTC3D = true;
+						// Some Android GPU drivers advertise the ASTC extensions but still
+						// reject a specific block size/profile (HDR and sliced-3D are far less
+						// mature across vendors than 2D LDR ASTC) -- confirm the upload actually
+						// took before trusting it, instead of leaving the texture undefined on
+						// the GPU. Drain the full error queue so a rejection here can never leak
+						// into an unrelated glGetError() check elsewhere in the engine.
+						bool bASTCUploadOK = true;
+						while ( gGL->glGetError() != GL_NO_ERROR ) { bASTCUploadOK = false; }
+						bDidASTC3D = bASTCUploadOK;
 					}
 				}
 
