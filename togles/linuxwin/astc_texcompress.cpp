@@ -23,6 +23,8 @@
 
 #if defined( HAVE_ASTCENC )
 	#include <astcenc.h>
+	#include <thread>	// per-texture multithreaded compression -- see GetClampedThreadCount() below
+	#include <vector>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -484,6 +486,95 @@ static void* BuildRGBABuffer( const void* srcData, int width, int height,
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Context caching + per-texture multithreading.
+//
+// astcenc_context_alloc() does real setup work (building per-config
+// partition/quantization tables), so allocating a fresh one for every single
+// texture -- as the first version of this file did -- is a needless stall,
+// worst right at level load when hundreds of textures upload back to back.
+// This keeps at most one context per (profile, thread-count-bucket) alive
+// for the life of the process and only rebuilds it if the block size or
+// quality changes (which only happens if the gl_astc_* convars are changed,
+// not per-texture).
+//
+// LOADING-TIME COST: encoding is real CPU work, and doing it single-threaded
+// for every texture during a level load is the single biggest cause of
+// loading stalls/freezes (on Android this risks the OS killing the process
+// outright if the main thread blocks past the ANR timeout). astcenc's own
+// API is built to compress ONE image across multiple threads -- the caller
+// spawns N threads that each call astcenc_compress_image() with a distinct
+// thread_index in [0, N), and the library partitions that image's blocks
+// across them internally. This uses that support: each texture's own
+// compression is spread across the CPU's cores instead of running on one.
+// Small textures skip the extra threads (spawn overhead would exceed any
+// benefit); everything above kMinBlocksForThreading uses them.
+//
+// THREAD SAFETY: this assumes ASTC_CompressTexture() is only ever called
+// from one thread at a time (true for this codebase -- it's only reached
+// from CGLMTex::WriteTexels(), which runs on the thread that owns the GL
+// context, same as every gGL-> call). The worker threads spawned here are
+// internal to a single call and are always fully joined before it returns,
+// so this is safe even though the codebase generally avoids background
+// threads elsewhere. If texture uploads are ever made to happen from
+// multiple threads concurrently, this cache needs a lock.
+// ---------------------------------------------------------------------------
+#if defined( HAVE_ASTCENC )
+
+static const int kMinBlocksForThreading = 256;	// e.g. a 64x64 texture at 4x4 blocks
+
+static unsigned int GetClampedThreadCount()
+{
+	unsigned int n = std::thread::hardware_concurrency();
+	if ( n == 0 ) n = 4;	// hardware_concurrency() is allowed to return 0 if it can't tell
+	if ( n > 8 ) n = 8;		// diminishing returns beyond this for a single texture's blocks
+	return n;
+}
+
+struct CachedASTCContext
+{
+	bool valid;
+	int blockW, blockH;
+	float quality;
+	int threadCount;
+	astcenc_context* ctx;
+};
+static CachedASTCContext s_astcContextCache[4];	// [isHDR*2 + (useMultiThread?1:0)]
+
+static astcenc_context* GetOrCreateCachedContext( bool isHDR, int blockW, int blockH, float quality, int threadCount )
+{
+	CachedASTCContext& slot = s_astcContextCache[ (isHDR ? 2 : 0) + (threadCount > 1 ? 1 : 0) ];
+
+	if ( slot.valid && slot.blockW == blockW && slot.blockH == blockH
+		&& slot.quality == quality && slot.threadCount == threadCount )
+		return slot.ctx;
+
+	if ( slot.valid )
+	{
+		astcenc_context_free( slot.ctx );
+		slot.valid = false;
+		slot.ctx = nullptr;
+	}
+
+	astcenc_profile profile = isHDR ? ASTCENC_PRF_HDR : ASTCENC_PRF_LDR;
+	astcenc_config config;
+	if ( astcenc_config_init( profile, blockW, blockH, 1, quality, 0, &config ) != ASTCENC_SUCCESS )
+		return nullptr;
+
+	astcenc_context* ctx = nullptr;
+	if ( astcenc_context_alloc( &config, threadCount, &ctx ) != ASTCENC_SUCCESS )
+		return nullptr;
+
+	slot.valid = true;
+	slot.blockW = blockW;
+	slot.blockH = blockH;
+	slot.quality = quality;
+	slot.threadCount = threadCount;
+	slot.ctx = ctx;
+	return ctx;
+}
+#endif // HAVE_ASTCENC
+
 bool ASTC_CompressTexture(
 	const void* srcData,
 	int width,
@@ -510,8 +601,6 @@ bool ASTC_CompressTexture(
 	if ( !rgba )
 		return false;
 
-	astcenc_profile profile = isHDR ? ASTCENC_PRF_HDR : ASTCENC_PRF_LDR;
-
 	float quality = ASTCENC_PRE_MEDIUM;
 	if ( qualityPreset <= 10 )      quality = ASTCENC_PRE_FASTEST;
 	else if ( qualityPreset <= 35 ) quality = ASTCENC_PRE_FAST;
@@ -519,22 +608,26 @@ bool ASTC_CompressTexture(
 	else if ( qualityPreset <= 90 ) quality = ASTCENC_PRE_THOROUGH;
 	else                            quality = ASTCENC_PRE_EXHAUSTIVE;
 
-	astcenc_config config;
-	astcenc_error status = astcenc_config_init(
-		profile, blockW, blockH, 1, quality, 0, &config );
-	if ( status != ASTCENC_SUCCESS )
-	{
-		free( rgba );
-		return false;
-	}
+	// Reuses a cached context instead of alloc+free on every single texture --
+	// context setup does real work (building per-config tables), so doing it
+	// per-call was a needless stall, worst at level load when hundreds of
+	// textures upload back to back. See GetOrCreateCachedContext() above.
+	//
+	// Block count decides whether this texture is worth spreading across
+	// multiple threads -- tiny textures aren't, the thread-spawn cost alone
+	// would cost more than it saves.
+	int xBlocks = (width  + blockW - 1) / blockW;
+	int yBlocks = (height + blockH - 1) / blockH;
+	int totalBlocks = xBlocks * yBlocks;
+	int threadCount = ( totalBlocks >= kMinBlocksForThreading ) ? (int)GetClampedThreadCount() : 1;
 
-	astcenc_context* context = nullptr;
-	status = astcenc_context_alloc( &config, 1 /*thread count*/, &context );
-	if ( status != ASTCENC_SUCCESS )
+	astcenc_context* context = GetOrCreateCachedContext( isHDR, blockW, blockH, quality, threadCount );
+	if ( !context )
 	{
 		free( rgba );
 		return false;
 	}
+	astcenc_compress_reset( context );	// required before reusing a context for a new image
 
 	astcenc_image image;
 	image.dim_x = width;
@@ -546,21 +639,45 @@ bool ASTC_CompressTexture(
 
 	astcenc_swizzle swizzle { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
 
-	int xBlocks = (width  + blockW - 1) / blockW;
-	int yBlocks = (height + blockH - 1) / blockH;
-	size_t compSize = (size_t)xBlocks * yBlocks * 16; // ASTC blocks are always 16 bytes
+	size_t compSize = (size_t)totalBlocks * 16; // ASTC blocks are always 16 bytes
 
 	uint8_t* compData = (uint8_t*)malloc( compSize );
 	if ( !compData )
 	{
-		astcenc_context_free( context );
 		free( rgba );
 		return false;
 	}
 
-	status = astcenc_compress_image( context, &image, &swizzle, compData, compSize, 0 );
+	// Spread this one texture's compression across `threadCount` threads --
+	// astcenc partitions the image's blocks across whatever thread indices
+	// [0, threadCount) actually get called; every one of them must run and
+	// finish before the result in compData is complete. The calling thread
+	// does index 0 itself instead of spawning one more thread than needed.
+	astcenc_error status = ASTCENC_SUCCESS;
+	if ( threadCount > 1 )
+	{
+		std::vector<std::thread> workers;
+		workers.reserve( threadCount - 1 );
+		std::vector<astcenc_error> workerStatus( threadCount, ASTCENC_SUCCESS );
+		for ( int t = 1; t < threadCount; ++t )
+		{
+			workers.emplace_back( [&, t]()
+			{
+				workerStatus[t] = astcenc_compress_image( context, &image, &swizzle, compData, compSize, t );
+			} );
+		}
+		status = astcenc_compress_image( context, &image, &swizzle, compData, compSize, 0 );
+		for ( auto& w : workers ) w.join();
+		for ( int t = 1; t < threadCount; ++t )
+		{
+			if ( workerStatus[t] != ASTCENC_SUCCESS ) status = workerStatus[t];
+		}
+	}
+	else
+	{
+		status = astcenc_compress_image( context, &image, &swizzle, compData, compSize, 0 );
+	}
 
-	astcenc_context_free( context );
 	free( rgba );
 
 	if ( status != ASTCENC_SUCCESS )
