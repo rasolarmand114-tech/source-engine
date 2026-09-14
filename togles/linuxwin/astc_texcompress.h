@@ -126,6 +126,41 @@ bool ASTC_IsDXTFormat( int d3dFormat );
 // therefore must be encoded with the ASTC HDR profile instead of LDR.
 bool ASTC_IsHDRFormat( int d3dFormat );
 
+// Same as ASTC_CompressTexture(), but the source is DXT1/DXT3/DXT5-
+// compressed block data (dxtD3DFormat must satisfy ASTC_IsDXTFormat()).
+void ASTC_FreeResult( ASTCEncodeResult* result );
+
+// Exact byte size of one source texel for (glFormat, glType) -- 0 if this
+// module doesn't recognize the combination. Used to walk between Z-layers
+// of a volume (GL_TEXTURE_3D) texture for the sliced-3D functions below.
+uint32_t ASTC_GetSrcBytesPerTexel( unsigned int glFormat, unsigned int glType );
+
+// Preferred entry point for the 2D uncompressed path -- same behavior and
+// parameters as ASTC_CompressTexture(), but content-addressed: if these
+// exact source bytes have been compressed before (by any texture, not just
+// this one), the cached ASTC result is returned directly with no
+// re-encoding. textureIdentity should be the owning CGLMTex's `this`
+// pointer; pass nullptr to skip only the give-up tracking (the content
+// cache still applies) -- used internally for the per-slice 3D path, where
+// tracking at that granularity isn't worthwhile. If the same identity
+// produces genuinely new (cache-miss) content several times in a row it is
+// assumed to be updated live (video texture, dynamic lightmap, ...) and
+// compression is skipped for it until it produces a cache hit again. See
+// the implementation comment in astc_texcompress.cpp for the full design
+// and why this replaced an earlier, simpler "first write only" version.
+bool ASTC_CompressTextureCached(
+	const void* textureIdentity,
+	const void* srcData,
+	int width,
+	int height,
+	unsigned int srcGLFormat,
+	unsigned int srcGLType,
+	bool isHDR,
+	int blockW,
+	int blockH,
+	int qualityPreset,
+	ASTCEncodeResult* outResult );
+
 // Encodes an RGBA (or RGBA-compatible) source image into ASTC blocks.
 //   srcData        - tightly packed source texels, top row first
 //   width, height  - texel dimensions (need not be a multiple of the block size;
@@ -142,7 +177,9 @@ bool ASTC_IsHDRFormat( int d3dFormat );
 // Returns false (and leaves *outResult untouched) if astcenc isn't compiled
 // in (HAVE_ASTCENC not defined), the format isn't supported, or encoding
 // failed for any reason -- callers must fall back to the normal uncompressed
-// upload path in that case.
+// upload path in that case. Called by ASTC_CompressTextureCached() above,
+// which is the entry point cglmtex.cpp actually uses; call this directly
+// only if you specifically want to bypass the cache.
 bool ASTC_CompressTexture(
 	const void* srcData,
 	int width,
@@ -155,13 +192,11 @@ bool ASTC_CompressTexture(
 	int qualityPreset,
 	ASTCEncodeResult* outResult );
 
-// Same as ASTC_CompressTexture(), but the source is DXT1/DXT3/DXT5-
-// compressed block data (dxtD3DFormat must satisfy ASTC_IsDXTFormat()).
-// Internally decompresses to RGBA8 (via decompress.h) then encodes ASTC
-// LDR. width/height must each be a multiple of 4 (standard DXT block
-// requirement) -- returns false otherwise so the caller can fall back to
-// uploading the original DXT bytes unchanged.
-bool ASTC_CompressDXTToASTC(
+// Preferred entry point for the DXT1/3/5 decompress-then-encode path -- same
+// content-addressed caching and give-up behavior as
+// ASTC_CompressTextureCached() above, see its comment for the full design.
+bool ASTC_CompressDXTToASTCCached(
+	const void* textureIdentity,
 	const void* dxtSrcData,
 	int width,
 	int height,
@@ -169,23 +204,22 @@ bool ASTC_CompressDXTToASTC(
 	int qualityPreset,
 	ASTCEncodeResult* outResult );
 
-void ASTC_FreeResult( ASTCEncodeResult* result );
-
-// Exact byte size of one source texel for (glFormat, glType) -- 0 if this
-// module doesn't recognize the combination. Used to walk between Z-layers
-// of a volume (GL_TEXTURE_3D) texture for the sliced-3D functions below.
-uint32_t ASTC_GetSrcBytesPerTexel( unsigned int glFormat, unsigned int glType );
-
-// Call once per texture, right alongside the existing format/render-target
-// eligibility checks, passing the owning CGLMTex's `this` pointer as
-// textureIdentity. Returns true only the first time it's called for a given
-// identity -- every call after that returns false, on the assumption that a
-// texture rewritten more than once is being updated live (video texture,
-// dynamic lightmap, per-frame UI, ...) and re-compressing it on every update
-// is real, recurring CPU cost that a one-time-loaded static texture never
-// pays. See the implementation comment in astc_texcompress.cpp for why
-// identity must be the CGLMTex object itself and not the shared layout.
-bool ASTC_ShouldAttemptCompression( const void* textureIdentity );
+// Same as ASTC_CompressTexture(), but the source is DXT1/DXT3/DXT5-
+// compressed block data (dxtD3DFormat must satisfy ASTC_IsDXTFormat()).
+// Internally decompresses to RGBA8 (via decompress.h) then encodes ASTC
+// LDR. width/height must each be a multiple of 4 (standard DXT block
+// requirement) -- returns false otherwise so the caller can fall back to
+// uploading the original DXT bytes unchanged. Called by
+// ASTC_CompressDXTToASTCCached() above, which is the entry point
+// cglmtex.cpp actually uses; call this directly only if you specifically
+// want to bypass the cache.
+bool ASTC_CompressDXTToASTC(
+	const void* dxtSrcData,
+	int width,
+	int height,
+	int dxtD3DFormat,
+	int qualityPreset,
+	ASTCEncodeResult* outResult );
 
 // GL_TEXTURE_3D (volume texture) support via
 // GL_KHR_texture_compression_astc_sliced_3d: each Z-layer is compressed as
