@@ -3679,7 +3679,8 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				if ( !gl_astc_debug_disable.GetBool()
 					&& sliceAddress != NULL
 					&& !(m_layout->m_key.m_texFlags & (kGLMTexMultisampled|kGLMTexRenderable))
-					&& ASTC_IsDXTFormat( (int)m_layout->m_key.m_texFormat ) )
+					&& ASTC_IsDXTFormat( (int)m_layout->m_key.m_texFormat )
+					&& ASTC_ShouldAttemptCompression( (const void*)this ) )
 				{
 					ASTCEncodeResult astcResult;
 					if ( ASTC_CompressDXTToASTC( sliceAddress, slice->m_xSize, slice->m_ySize,
@@ -3779,7 +3780,8 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 						&& !noDataWrite
 						&& sliceAddress != NULL
 						&& !(m_layout->m_key.m_texFlags & (kGLMTexMultisampled|kGLMTexRenderable))
-						&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat ) )
+						&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat )
+						&& ASTC_ShouldAttemptCompression( (const void*)this ) )
 					{
 						bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
 						int blockW, blockH;
@@ -3860,7 +3862,8 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				// MANDATORY, same as the 2D compressed path: an already-DXT-
 				// compressed volume texture is decompressed per Z-layer and
 				// re-encoded as ASTC via GL_KHR_texture_compression_astc_sliced_3d.
-				if ( bASTCEligible3D && ASTC_IsDXTFormat( (int)m_layout->m_key.m_texFormat ) )
+				if ( bASTCEligible3D && ASTC_IsDXTFormat( (int)m_layout->m_key.m_texFormat )
+					&& ASTC_ShouldAttemptCompression( (const void*)this ) )
 				{
 					ASTCEncodeResult astcResult;
 					if ( ASTC_CompressDXTToASTC3DSliced( sliceAddress, slice->m_xSize, slice->m_ySize,
@@ -3907,7 +3910,8 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 				// GL_KHR_texture_compression_astc_sliced_3d -- one ordinary
 				// 2D ASTC image per Z-layer, concatenated.
 				if ( bASTCEligible3D && !noDataWrite
-					&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat ) )
+					&& ASTC_IsEligibleFormat( (int)m_layout->m_key.m_texFormat )
+					&& ASTC_ShouldAttemptCompression( (const void*)this ) )
 				{
 					bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
 					int blockW, blockH;
