@@ -176,6 +176,17 @@ void ASTC_FreeResult( ASTCEncodeResult* result );
 // of a volume (GL_TEXTURE_3D) texture for the sliced-3D functions below.
 uint32_t ASTC_GetSrcBytesPerTexel( unsigned int glFormat, unsigned int glType );
 
+// Call once per texture, right alongside the existing format/render-target
+// eligibility checks, passing the owning CGLMTex's `this` pointer as
+// textureIdentity. Returns true only the first time it's called for a given
+// identity -- every call after that returns false, on the assumption that a
+// texture rewritten more than once is being updated live (video texture,
+// dynamic lightmap, per-frame UI, ...) and re-compressing it on every update
+// is real, recurring CPU cost that a one-time-loaded static texture never
+// pays. See the implementation comment in astc_texcompress.cpp for why
+// identity must be the CGLMTex object itself and not the shared layout.
+bool ASTC_ShouldAttemptCompression( const void* textureIdentity );
+
 // GL_TEXTURE_3D (volume texture) support via
 // GL_KHR_texture_compression_astc_sliced_3d: each Z-layer is compressed as
 // an independent standard 2D ASTC image (same block dims/internal format as
