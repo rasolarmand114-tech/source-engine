@@ -20,7 +20,8 @@
 // the "already compressed -> decompress -> re-encode as ASTC" path.
 #include "togles/rendermechanism.h"
 #include "decompress.h"
-#include <unordered_set>	// used by ASTC_ShouldAttemptCompression() below, unconditionally (no astcenc dependency)
+#include <unordered_map>	// content-addressed compressed-texture cache, see ASTC_CompressTextureCached() below
+#include <deque>
 
 #if defined( HAVE_ASTCENC )
 	#include <astcenc.h>
@@ -577,56 +578,183 @@ static astcenc_context* GetOrCreateCachedContext( bool isHDR, int blockW, int bl
 #endif // HAVE_ASTCENC
 
 // ---------------------------------------------------------------------------
-// Skip mandatory compression for textures that get fully rewritten more than
-// once -- a real, one-time-loaded static texture (the vast majority of a
-// game's texture memory) hits this exactly once and always benefits from
-// ASTC. A texture that gets a second full-slice write (video textures,
-// dynamic lightmaps, per-frame-redrawn UI, etc.) is evidently being updated
-// live; recompressing it on every single update is real, recurring CPU cost
-// competing with the game's own per-frame budget -- that recurring cost, not
-// the one-off cost of compressing a static asset at load time, is what shows
-// up as in-game frame drops. So: compress on the first observed write for a
-// given texture identity, skip on every write after that.
+// Content-addressed compressed-texture cache + per-identity give-up.
 //
-// Identity is the owning CGLMTex object's `this` pointer (passed in by
-// cglmtex.cpp), NOT the shared GLMTexLayout pointer -- layouts are reused
-// across multiple distinct textures of the same format/size, so keying on
-// that would make one texture's "already seen" wrongly suppress compression
-// for a completely different texture that merely shares its layout.
+// This replaces an earlier version of this file that tracked "has this
+// texture OBJECT been written before" by pointer. That was wrong whenever a
+// texture object's memory could be reused for a totally different, later
+// texture (an object pool, for instance) -- a brand new static texture that
+// happened to reuse an old address would be permanently, silently treated
+// as "already seen" and never get compressed. Tracking real content instead
+// fixes that, and is also just a more literal reading of "compress each
+// texture once, then reuse that compression": the identity of a texture, for
+// this purpose, is its bytes, not the object that happens to be holding them
+// at a given moment.
 //
-// Bounded ring + set so memory doesn't grow for the life of the process --
-// oldest identity is evicted once the ring fills. If a genuinely long-lived
-// static texture's entry gets evicted by enough churn from OTHER textures
-// and it somehow got rewritten again, worst case is one extra harmless
-// recompression, not a correctness problem.
+// How it works:
+//   1. Hash the source pixel bytes (+ dimensions/format, so two different
+//      formats that happened to hash the same raw bytes can't collide).
+//   2. If that exact content has been compressed before -- by ANY texture,
+//      not just this one -- reuse the cached ASTC bytes directly. Zero
+//      re-encode cost. This is the actual "compress once, reuse" behavior.
+//   3. If it's new content, compress it for real and add it to the cache.
+//   4. Separately, per texture IDENTITY (the owning CGLMTex's `this`
+//      pointer), count consecutive cache MISSES. A texture whose content is
+//      genuinely different every time it's written (a video texture, a
+//      live-updating lightmap) will miss every time and its streak will
+//      climb; once it crosses a small threshold we stop attempting fresh
+//      compression for that identity (it falls back to the normal
+//      uncompressed/DXT path) until/unless it produces a hit again, which
+//      resets the streak. A one-off address reuse for an unrelated new
+//      static texture only ever counts as a single miss -- it compresses
+//      fine and is never mistaken for a dynamic texture just for having
+//      reused an old address.
+//
+// Both caches are bounded so memory can't grow for the life of the process:
+// the compressed-bytes cache by total byte budget (oldest evicted first),
+// the per-identity streak table by entry count.
 // ---------------------------------------------------------------------------
-static const int kSeenTextureCapacity = 4096;
-static const void* s_seenTextureRing[kSeenTextureCapacity];
-static int s_seenTextureRingHead = 0;
-static int s_seenTextureRingCount = 0;
-static std::unordered_set<const void*> s_seenTextureSet;
 
-bool ASTC_ShouldAttemptCompression( const void* textureIdentity )
+static uint64_t HashTextureContent( const void* data, size_t len, int width, int height,
+									 unsigned int glFormat, unsigned int glType )
 {
-	if ( !textureIdentity )
-		return true;	// no identity available -- caller loses the skip-on-repeat optimization but nothing breaks
-
-	if ( s_seenTextureSet.count( textureIdentity ) )
-		return false;	// seen a full-slice write from this texture before -- treat as dynamic, don't recompress
-
-	if ( s_seenTextureRingCount == kSeenTextureCapacity )
+	// FNV-1a 64-bit. Not cryptographic, doesn't need to be -- this is a
+	// cache key, not a security boundary, and a 64-bit hash makes an
+	// accidental collision between two different real textures astronomically
+	// unlikely. Seeding with dimensions/format means two different formats
+	// that happen to share raw byte patterns can never collide either.
+	uint64_t h = 1469598103934665603ULL;
+	auto mix = [&h]( uint64_t v ) { h ^= v; h *= 1099511628211ULL; };
+	mix( (uint64_t)width );
+	mix( (uint64_t)height );
+	mix( (uint64_t)glFormat );
+	mix( (uint64_t)glType );
+	const uint8_t* p = (const uint8_t*)data;
+	for ( size_t i = 0; i < len; ++i )
 	{
-		const void* evicted = s_seenTextureRing[ s_seenTextureRingHead ];
-		s_seenTextureSet.erase( evicted );
+		h ^= p[i];
+		h *= 1099511628211ULL;
 	}
-	else
+	return h;
+}
+
+struct CachedCompressedEntry
+{
+	void* data;
+	uint32_t dataSize;
+	uint32_t glInternalFormat;
+	int blockW, blockH;
+	EASTCProfile profile;
+};
+
+static const size_t kCompressedCacheByteBudget = 64ull * 1024 * 1024;	// 64MB total, oldest evicted first
+static std::unordered_map<uint64_t, CachedCompressedEntry> s_compressedCache;
+static std::deque<uint64_t> s_compressedCacheOrder;
+static size_t s_compressedCacheBytes = 0;
+
+static void CompressedCacheEvictUntilUnderBudget()
+{
+	while ( s_compressedCacheBytes > kCompressedCacheByteBudget && !s_compressedCacheOrder.empty() )
 	{
-		s_seenTextureRingCount++;
+		uint64_t oldestKey = s_compressedCacheOrder.front();
+		s_compressedCacheOrder.pop_front();
+		auto it = s_compressedCache.find( oldestKey );
+		if ( it != s_compressedCache.end() )
+		{
+			s_compressedCacheBytes -= it->second.dataSize;
+			free( it->second.data );
+			s_compressedCache.erase( it );
+		}
 	}
-	s_seenTextureRing[ s_seenTextureRingHead ] = textureIdentity;
-	s_seenTextureRingHead = ( s_seenTextureRingHead + 1 ) % kSeenTextureCapacity;
-	s_seenTextureSet.insert( textureIdentity );
+}
+
+static bool CompressedCacheLookup( uint64_t key, ASTCEncodeResult* outResult )
+{
+	auto it = s_compressedCache.find( key );
+	if ( it == s_compressedCache.end() )
+		return false;
+
+	// Return an owned copy -- callers always free the result themselves via
+	// ASTC_FreeResult(), whether it came from a fresh compress or the cache.
+	void* copy = malloc( it->second.dataSize );
+	if ( !copy )
+		return false;
+	memcpy( copy, it->second.data, it->second.dataSize );
+
+	outResult->m_pData = copy;
+	outResult->m_nDataSize = it->second.dataSize;
+	outResult->m_glInternalFormat = it->second.glInternalFormat;
+	outResult->m_blockW = it->second.blockW;
+	outResult->m_blockH = it->second.blockH;
+	outResult->m_profile = it->second.profile;
 	return true;
+}
+
+static void CompressedCacheStore( uint64_t key, const ASTCEncodeResult& result )
+{
+	if ( s_compressedCache.count( key ) )
+		return;	// already cached (shouldn't normally happen -- lookup runs first -- but never double-store)
+
+	void* copy = malloc( result.m_nDataSize );
+	if ( !copy )
+		return;	// cache is best-effort; caller already has its own copy of the result regardless
+	memcpy( copy, result.m_pData, result.m_nDataSize );
+
+	CachedCompressedEntry entry;
+	entry.data = copy;
+	entry.dataSize = result.m_nDataSize;
+	entry.glInternalFormat = result.m_glInternalFormat;
+	entry.blockW = result.m_blockW;
+	entry.blockH = result.m_blockH;
+	entry.profile = result.m_profile;
+
+	s_compressedCache.emplace( key, entry );
+	s_compressedCacheOrder.push_back( key );
+	s_compressedCacheBytes += entry.dataSize;
+	CompressedCacheEvictUntilUnderBudget();
+}
+
+// Per-identity consecutive-cache-miss streak. Bounded entry count, oldest
+// evicted first -- these entries are tiny (a pointer and an int) so a
+// generous capacity costs very little memory.
+static const int kMissStreakCapacity = 16384;
+static const int kMissStreakGiveUpThreshold = 3;
+static std::unordered_map<const void*, int> s_missStreak;
+static std::deque<const void*> s_missStreakOrder;
+
+static bool IdentityHasGivenUp( const void* identity )
+{
+	auto it = s_missStreak.find( identity );
+	return it != s_missStreak.end() && it->second >= kMissStreakGiveUpThreshold;
+}
+
+static void IdentityRecordHit( const void* identity )
+{
+	if ( !identity ) return;
+	auto it = s_missStreak.find( identity );
+	if ( it != s_missStreak.end() )
+		it->second = 0;	// content reappeared -- this identity isn't relentlessly novel, don't penalize it
+}
+
+static void IdentityRecordMiss( const void* identity )
+{
+	if ( !identity ) return;
+
+	auto it = s_missStreak.find( identity );
+	if ( it != s_missStreak.end() )
+	{
+		it->second++;
+		return;
+	}
+
+	if ( (int)s_missStreak.size() >= kMissStreakCapacity && !s_missStreakOrder.empty() )
+	{
+		const void* oldest = s_missStreakOrder.front();
+		s_missStreakOrder.pop_front();
+		s_missStreak.erase( oldest );
+	}
+	s_missStreak[ identity ] = 1;
+	s_missStreakOrder.push_back( identity );
 }
 
 bool ASTC_CompressTexture(
@@ -850,6 +978,96 @@ bool ASTC_CompressDXTToASTC(
 #endif
 }
 
+bool ASTC_CompressTextureCached(
+	const void* textureIdentity,
+	const void* srcData,
+	int width,
+	int height,
+	unsigned int srcGLFormat,
+	unsigned int srcGLType,
+	bool isHDR,
+	int blockW,
+	int blockH,
+	int qualityPreset,
+	ASTCEncodeResult* outResult )
+{
+#if !defined( HAVE_ASTCENC )
+	(void)textureIdentity; (void)srcData; (void)width; (void)height; (void)srcGLFormat;
+	(void)srcGLType; (void)isHDR; (void)blockW; (void)blockH; (void)qualityPreset; (void)outResult;
+	return false;
+#else
+	if ( !srcData || width <= 0 || height <= 0 || !outResult )
+		return false;
+
+	uint32_t texelSize = ASTC_GetSrcBytesPerTexel( srcGLFormat, srcGLType );
+	if ( texelSize == 0 )
+		return false;
+
+	uint64_t key = HashTextureContent( srcData, (size_t)width * height * texelSize,
+										width, height, srcGLFormat, srcGLType );
+
+	if ( CompressedCacheLookup( key, outResult ) )
+	{
+		IdentityRecordHit( textureIdentity );
+		return true;
+	}
+
+	if ( IdentityHasGivenUp( textureIdentity ) )
+		return false;	// this identity has repeatedly produced novel content -- stop paying to compress it
+
+	if ( !ASTC_CompressTexture( srcData, width, height, srcGLFormat, srcGLType,
+								 isHDR, blockW, blockH, qualityPreset, outResult ) )
+		return false;
+
+	CompressedCacheStore( key, *outResult );
+	IdentityRecordMiss( textureIdentity );
+	return true;
+#endif
+}
+
+bool ASTC_CompressDXTToASTCCached(
+	const void* textureIdentity,
+	const void* dxtSrcData,
+	int width,
+	int height,
+	int dxtD3DFormat,
+	int qualityPreset,
+	ASTCEncodeResult* outResult )
+{
+#if !defined( HAVE_ASTCENC )
+	(void)textureIdentity; (void)dxtSrcData; (void)width; (void)height;
+	(void)dxtD3DFormat; (void)qualityPreset; (void)outResult;
+	return false;
+#else
+	if ( !dxtSrcData || !outResult || !ASTC_IsDXTFormat( dxtD3DFormat ) )
+		return false;
+	if ( (width % 4) != 0 || (height % 4) != 0 || width <= 0 || height <= 0 )
+		return false;
+
+	int dxtBlockBytes = ( dxtD3DFormat == D3DFMT_DXT1 ) ? 8 : 16;
+	size_t dxtByteSize = (size_t)(width / 4) * (height / 4) * dxtBlockBytes;
+
+	uint64_t key = HashTextureContent( dxtSrcData, dxtByteSize, width, height,
+										(unsigned int)dxtD3DFormat, 0 /*no glType for DXT source*/ );
+
+	if ( CompressedCacheLookup( key, outResult ) )
+	{
+		IdentityRecordHit( textureIdentity );
+		return true;
+	}
+
+	if ( IdentityHasGivenUp( textureIdentity ) )
+		return false;
+
+	if ( !ASTC_CompressDXTToASTC( dxtSrcData, width, height, dxtD3DFormat, qualityPreset, outResult ) )
+		return false;
+
+	CompressedCacheStore( key, *outResult );
+	IdentityRecordMiss( textureIdentity );
+	return true;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // GL_TEXTURE_3D (volume textures) via GL_KHR_texture_compression_astc_sliced_3d
 //
@@ -900,7 +1118,10 @@ bool ASTC_CompressTexture3DSliced(
 	for ( int z = 0; z < depth; ++z )
 	{
 		ASTCEncodeResult sliceResult;
-		bool ok = ASTC_CompressTexture( srcBase + (size_t)z * sliceByteStride, width, height,
+		// nullptr identity: per-slice give-up tracking isn't worth it at this
+		// granularity (3D textures are rare compared to 2D) -- each slice still
+		// gets the content-cache reuse benefit, just not the miss-streak one.
+		bool ok = ASTC_CompressTextureCached( nullptr, srcBase + (size_t)z * sliceByteStride, width, height,
 										 srcGLFormat, srcGLType, isHDR, blockW, blockH,
 										 qualityPreset, &sliceResult );
 		if ( !ok || sliceResult.m_nDataSize != perSliceCompSize )
@@ -964,7 +1185,7 @@ bool ASTC_CompressDXTToASTC3DSliced(
 	for ( int z = 0; z < depth; ++z )
 	{
 		ASTCEncodeResult sliceResult;
-		bool ok = ASTC_CompressDXTToASTC( srcBase + (size_t)z * dxtBytesPerSlice, width, height,
+		bool ok = ASTC_CompressDXTToASTCCached( nullptr, srcBase + (size_t)z * dxtBytesPerSlice, width, height,
 										   dxtD3DFormat, qualityPreset, &sliceResult );
 		if ( !ok || sliceResult.m_nDataSize != perSliceCompSize )
 		{
