@@ -20,6 +20,7 @@
 // the "already compressed -> decompress -> re-encode as ASTC" path.
 #include "togles/rendermechanism.h"
 #include "decompress.h"
+#include <unordered_set>	// used by ASTC_ShouldAttemptCompression() below, unconditionally (no astcenc dependency)
 
 #if defined( HAVE_ASTCENC )
 	#include <astcenc.h>
@@ -574,6 +575,59 @@ static astcenc_context* GetOrCreateCachedContext( bool isHDR, int blockW, int bl
 	return ctx;
 }
 #endif // HAVE_ASTCENC
+
+// ---------------------------------------------------------------------------
+// Skip mandatory compression for textures that get fully rewritten more than
+// once -- a real, one-time-loaded static texture (the vast majority of a
+// game's texture memory) hits this exactly once and always benefits from
+// ASTC. A texture that gets a second full-slice write (video textures,
+// dynamic lightmaps, per-frame-redrawn UI, etc.) is evidently being updated
+// live; recompressing it on every single update is real, recurring CPU cost
+// competing with the game's own per-frame budget -- that recurring cost, not
+// the one-off cost of compressing a static asset at load time, is what shows
+// up as in-game frame drops. So: compress on the first observed write for a
+// given texture identity, skip on every write after that.
+//
+// Identity is the owning CGLMTex object's `this` pointer (passed in by
+// cglmtex.cpp), NOT the shared GLMTexLayout pointer -- layouts are reused
+// across multiple distinct textures of the same format/size, so keying on
+// that would make one texture's "already seen" wrongly suppress compression
+// for a completely different texture that merely shares its layout.
+//
+// Bounded ring + set so memory doesn't grow for the life of the process --
+// oldest identity is evicted once the ring fills. If a genuinely long-lived
+// static texture's entry gets evicted by enough churn from OTHER textures
+// and it somehow got rewritten again, worst case is one extra harmless
+// recompression, not a correctness problem.
+// ---------------------------------------------------------------------------
+static const int kSeenTextureCapacity = 4096;
+static const void* s_seenTextureRing[kSeenTextureCapacity];
+static int s_seenTextureRingHead = 0;
+static int s_seenTextureRingCount = 0;
+static std::unordered_set<const void*> s_seenTextureSet;
+
+bool ASTC_ShouldAttemptCompression( const void* textureIdentity )
+{
+	if ( !textureIdentity )
+		return true;	// no identity available -- caller loses the skip-on-repeat optimization but nothing breaks
+
+	if ( s_seenTextureSet.count( textureIdentity ) )
+		return false;	// seen a full-slice write from this texture before -- treat as dynamic, don't recompress
+
+	if ( s_seenTextureRingCount == kSeenTextureCapacity )
+	{
+		const void* evicted = s_seenTextureRing[ s_seenTextureRingHead ];
+		s_seenTextureSet.erase( evicted );
+	}
+	else
+	{
+		s_seenTextureRingCount++;
+	}
+	s_seenTextureRing[ s_seenTextureRingHead ] = textureIdentity;
+	s_seenTextureRingHead = ( s_seenTextureRingHead + 1 ) % kSeenTextureCapacity;
+	s_seenTextureSet.insert( textureIdentity );
+	return true;
+}
 
 bool ASTC_CompressTexture(
 	const void* srcData,
