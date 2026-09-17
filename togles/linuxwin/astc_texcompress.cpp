@@ -22,6 +22,9 @@
 #include "decompress.h"
 #include <unordered_map>	// content-addressed compressed-texture cache, see ASTC_CompressTextureCached() below
 #include <deque>
+#include <mutex>			// guards the shared caches now that background worker threads exist
+#include <condition_variable>
+#include <chrono>
 
 #if defined( HAVE_ASTCENC )
 	#include <astcenc.h>
@@ -50,6 +53,17 @@ ConVar gl_astc_block_hdr( "gl_astc_block_hdr", "6x6", FCVAR_ARCHIVE,
 
 ConVar gl_astc_quality( "gl_astc_quality", "60", FCVAR_ARCHIVE,
 	"ASTC encoder quality/speed tradeoff, 0 (fastest) - 100 (thorough)." );
+
+ConVar gl_astc_async( "gl_astc_async", "1", FCVAR_ARCHIVE,
+	"Compress on background threads instead of blocking the GL thread. "
+	"The uncompressed/DXT texture uploads and is visible immediately; ASTC "
+	"silently replaces it once the background job finishes. Set to 0 to "
+	"fall back to the old synchronous behavior if async ever misbehaves." );
+
+ConVar gl_astc_async_workers( "gl_astc_async_workers", "2", FCVAR_ARCHIVE,
+	"Number of persistent background threads used for gl_astc_async. Kept "
+	"low by default to leave most cores free for the game itself -- the "
+	"point of async is spreading cost across frames, not maximum throughput." );
 
 // ---------------------------------------------------------------------------
 // Format classification
@@ -496,37 +510,44 @@ static void* BuildRGBABuffer( const void* srcData, int width, int height,
 // texture -- as the first version of this file did -- is a needless stall,
 // worst right at level load when hundreds of textures upload back to back.
 // This keeps at most one context per (profile, thread-count-bucket) alive
-// for the life of the process and only rebuilds it if the block size or
-// quality changes (which only happens if the gl_astc_* convars are changed,
-// not per-texture).
+// and only rebuilds it if the block size or quality changes (which only
+// happens if the gl_astc_* convars are changed, not per-texture).
 //
 // LOADING-TIME COST: encoding is real CPU work, and doing it single-threaded
-// for every texture during a level load is the single biggest cause of
-// loading stalls/freezes (on Android this risks the OS killing the process
-// outright if the main thread blocks past the ANR timeout). astcenc's own
-// API is built to compress ONE image across multiple threads -- the caller
-// spawns N threads that each call astcenc_compress_image() with a distinct
-// thread_index in [0, N), and the library partitions that image's blocks
-// across them internally. This uses that support: each texture's own
-// compression is spread across the CPU's cores instead of running on one.
-// Small textures skip the extra threads (spawn overhead would exceed any
-// benefit); everything above kMinBlocksForThreading uses them.
+// for every texture during a level load is a big cause of loading stalls.
+// astcenc's own API is built to compress ONE image across multiple threads
+// -- the caller spawns N threads that each call astcenc_compress_image()
+// with a distinct thread_index in [0, N), and the library partitions that
+// image's blocks across them internally. This uses that support: each
+// texture's own compression is spread across the CPU's cores instead of
+// running on one. Small textures skip the extra threads (spawn overhead
+// would exceed any benefit); everything above kMinBlocksForThreading uses
+// them -- UNLESS this is an async background worker thread (see
+// ASTC_EnqueueAsyncCompress2D() and friends further down), in which case
+// per-texture threading is forced off: cross-texture parallelism already
+// comes from having multiple worker threads each handling a different job,
+// and letting every job ALSO spawn up to 8 sub-threads would oversubscribe
+// the CPU (N workers x 8 sub-threads competing for far fewer real cores).
 //
-// THREAD SAFETY: this assumes ASTC_CompressTexture() is only ever called
-// from one thread at a time (true for this codebase -- it's only reached
-// from CGLMTex::WriteTexels(), which runs on the thread that owns the GL
-// context, same as every gGL-> call). The worker threads spawned here are
-// internal to a single call and are always fully joined before it returns,
-// so this is safe even though the codebase generally avoids background
-// threads elsewhere. If texture uploads are ever made to happen from
-// multiple threads concurrently, this cache needs a lock.
+// THREAD SAFETY: the context cache is thread_local -- the GL/main thread
+// (used for any remaining synchronous calls) and each background worker
+// thread get their own independent set of cached contexts, so nothing here
+// needs a lock. What DOES need one, and has it below, is the content cache
+// and give-up tracker, which are deliberately shared across every thread.
 // ---------------------------------------------------------------------------
 #if defined( HAVE_ASTCENC )
 
 static const int kMinBlocksForThreading = 256;	// e.g. a 64x64 texture at 4x4 blocks
 
+// Set to true once, at the top of an async worker thread's main loop (see
+// further down). Left false on the GL/main thread.
+thread_local bool t_bIsAsyncWorkerThread = false;
+
 static unsigned int GetClampedThreadCount()
 {
+	if ( t_bIsAsyncWorkerThread )
+		return 1;	// this thread IS the parallelism; don't also fan out within it
+
 	unsigned int n = std::thread::hardware_concurrency();
 	if ( n == 0 ) n = 4;	// hardware_concurrency() is allowed to return 0 if it can't tell
 	if ( n > 8 ) n = 8;		// diminishing returns beyond this for a single texture's blocks
@@ -541,11 +562,11 @@ struct CachedASTCContext
 	int threadCount;
 	astcenc_context* ctx;
 };
-static CachedASTCContext s_astcContextCache[4];	// [isHDR*2 + (useMultiThread?1:0)]
+thread_local CachedASTCContext t_astcContextCache[4];	// [isHDR*2 + (useMultiThread?1:0)] -- per-thread, see THREAD SAFETY above
 
 static astcenc_context* GetOrCreateCachedContext( bool isHDR, int blockW, int blockH, float quality, int threadCount )
 {
-	CachedASTCContext& slot = s_astcContextCache[ (isHDR ? 2 : 0) + (threadCount > 1 ? 1 : 0) ];
+	CachedASTCContext& slot = t_astcContextCache[ (isHDR ? 2 : 0) + (threadCount > 1 ? 1 : 0) ];
 
 	if ( slot.valid && slot.blockW == blockW && slot.blockH == blockH
 		&& slot.quality == quality && slot.threadCount == threadCount )
@@ -652,7 +673,15 @@ static std::unordered_map<uint64_t, CachedCompressedEntry> s_compressedCache;
 static std::deque<uint64_t> s_compressedCacheOrder;
 static size_t s_compressedCacheBytes = 0;
 
-static void CompressedCacheEvictUntilUnderBudget()
+// Guards s_compressedCache* AND s_missStreak* below -- both are shared across
+// every thread that can call the Cached compress functions now that async
+// background workers exist (see further down), unlike the per-thread context
+// cache above. Contention should be low: this is only held for cheap map/
+// deque operations and a memcpy of already-compressed (small) bytes, never
+// for the actual encode.
+static std::mutex s_astcSharedMutex;
+
+static void CompressedCacheEvictUntilUnderBudget()	// caller must hold s_astcSharedMutex
 {
 	while ( s_compressedCacheBytes > kCompressedCacheByteBudget && !s_compressedCacheOrder.empty() )
 	{
@@ -670,6 +699,8 @@ static void CompressedCacheEvictUntilUnderBudget()
 
 static bool CompressedCacheLookup( uint64_t key, ASTCEncodeResult* outResult )
 {
+	std::lock_guard<std::mutex> lock( s_astcSharedMutex );
+
 	auto it = s_compressedCache.find( key );
 	if ( it == s_compressedCache.end() )
 		return false;
@@ -692,8 +723,10 @@ static bool CompressedCacheLookup( uint64_t key, ASTCEncodeResult* outResult )
 
 static void CompressedCacheStore( uint64_t key, const ASTCEncodeResult& result )
 {
+	std::lock_guard<std::mutex> lock( s_astcSharedMutex );
+
 	if ( s_compressedCache.count( key ) )
-		return;	// already cached (shouldn't normally happen -- lookup runs first -- but never double-store)
+		return;	// already cached (e.g. two threads raced on the same new content) -- never double-store
 
 	void* copy = malloc( result.m_nDataSize );
 	if ( !copy )
@@ -724,6 +757,7 @@ static std::deque<const void*> s_missStreakOrder;
 
 static bool IdentityHasGivenUp( const void* identity )
 {
+	std::lock_guard<std::mutex> lock( s_astcSharedMutex );
 	auto it = s_missStreak.find( identity );
 	return it != s_missStreak.end() && it->second >= kMissStreakGiveUpThreshold;
 }
@@ -731,6 +765,7 @@ static bool IdentityHasGivenUp( const void* identity )
 static void IdentityRecordHit( const void* identity )
 {
 	if ( !identity ) return;
+	std::lock_guard<std::mutex> lock( s_astcSharedMutex );
 	auto it = s_missStreak.find( identity );
 	if ( it != s_missStreak.end() )
 		it->second = 0;	// content reappeared -- this identity isn't relentlessly novel, don't penalize it
@@ -739,6 +774,7 @@ static void IdentityRecordHit( const void* identity )
 static void IdentityRecordMiss( const void* identity )
 {
 	if ( !identity ) return;
+	std::lock_guard<std::mutex> lock( s_astcSharedMutex );
 
 	auto it = s_missStreak.find( identity );
 	if ( it != s_missStreak.end() )
@@ -1204,5 +1240,236 @@ bool ASTC_CompressDXTToASTC3DSliced(
 	outResult->m_blockH = blockH;
 	outResult->m_profile = kASTCProfile_LDR;
 	return true;
+#endif
+}
+
+// ===========================================================================
+// Asynchronous compression -- background worker pool + job queues.
+//
+// See the big comment block in astc_texcompress.h above the declarations of
+// ASTC_EnqueueAsyncCompress2D() / ASTC_EnqueueAsyncCompress3DSlice() /
+// ASTC_PumpCompletedAsyncJobs() for the design and its known trade-offs.
+// Everything in this section only matters when HAVE_ASTCENC is defined and
+// gl_astc_async is on; otherwise the public entry points below just no-op.
+// ===========================================================================
+#if defined( HAVE_ASTCENC )
+
+struct PendingAsyncJob
+{
+	const void* textureIdentity;
+	unsigned int texName;		// captured via glGetIntegerv(GL_TEXTURE_BINDING_2D) at enqueue time
+	unsigned int target;		// GL_TEXTURE_2D (2D only -- see header comment on ASTC_EnqueueAsyncCompress2D())
+	int mip;
+	void* srcDataCopy;			// owned by the job until a worker frees it
+	size_t srcDataSize;
+	int width, height;
+	bool isDXT;
+	int dxtD3DFormat;
+	unsigned int srcGLFormat, srcGLType;
+	bool isHDR;
+	int blockW, blockH;
+	int qualityPreset;
+	std::chrono::steady_clock::time_point enqueueTime;
+};
+
+struct CompletedAsyncJob
+{
+	unsigned int texName;
+	unsigned int target;
+	int mip;
+	int width, height;
+	ASTCEncodeResult result;
+};
+
+// A job older than this is dropped instead of applied when it's finally
+// popped off the pending queue -- bounds how long a stale GL texture name
+// could theoretically still be sitting in the pipeline (see the known-risk
+// note in the header). Encoding a texture almost never legitimately takes
+// this long; a job this old almost certainly means the queue backed up
+// under heavy load, and applying it that late isn't worth the residual risk.
+static const std::chrono::seconds kAsyncJobMaxAge( 10 );
+
+static std::mutex s_pendingMutex;
+static std::condition_variable s_pendingCV;
+static std::deque<PendingAsyncJob> s_pendingQueue;
+static bool s_asyncShutdown = false;
+
+static std::mutex s_completedMutex;
+static std::deque<CompletedAsyncJob> s_completedQueue;
+
+static std::vector<std::thread> s_asyncWorkers;
+static std::mutex s_asyncInitMutex;
+static bool s_asyncInitialized = false;
+
+static void AsyncWorkerThreadMain()
+{
+	t_bIsAsyncWorkerThread = true;
+
+	for ( ;; )
+	{
+		PendingAsyncJob job;
+		{
+			std::unique_lock<std::mutex> lock( s_pendingMutex );
+			s_pendingCV.wait( lock, [] { return s_asyncShutdown || !s_pendingQueue.empty(); } );
+			if ( s_asyncShutdown && s_pendingQueue.empty() )
+				return;
+			job = std::move( s_pendingQueue.front() );
+			s_pendingQueue.pop_front();
+		}
+
+		if ( std::chrono::steady_clock::now() - job.enqueueTime > kAsyncJobMaxAge )
+		{
+			free( job.srcDataCopy );
+			continue;	// stale -- see kAsyncJobMaxAge comment above
+		}
+
+		ASTCEncodeResult result;
+		bool ok = job.isDXT
+			? ASTC_CompressDXTToASTCCached( job.textureIdentity, job.srcDataCopy, job.width, job.height,
+											 job.dxtD3DFormat, job.qualityPreset, &result )
+			: ASTC_CompressTextureCached( job.textureIdentity, job.srcDataCopy, job.width, job.height,
+										   job.srcGLFormat, job.srcGLType, job.isHDR,
+										   job.blockW, job.blockH, job.qualityPreset, &result );
+		free( job.srcDataCopy );
+		if ( !ok )
+			continue;	// nothing lost -- the original uncompressed/DXT upload is already live
+
+		CompletedAsyncJob done;
+		done.texName = job.texName;
+		done.target = job.target;
+		done.mip = job.mip;
+		done.width = job.width;
+		done.height = job.height;
+		done.result = result;
+		{
+			std::lock_guard<std::mutex> lock( s_completedMutex );
+			s_completedQueue.push_back( done );
+		}
+	}
+}
+
+static void EnsureAsyncWorkersStarted()
+{
+	if ( s_asyncInitialized )
+		return;
+	std::lock_guard<std::mutex> lock( s_asyncInitMutex );
+	if ( s_asyncInitialized )
+		return;
+
+	int n = gl_astc_async_workers.GetInt();
+	if ( n < 1 ) n = 1;
+	if ( n > 8 ) n = 8;	// sanity clamp -- this is meant to be a small, low-impact pool
+
+	s_asyncWorkers.reserve( n );
+	for ( int i = 0; i < n; ++i )
+		s_asyncWorkers.emplace_back( AsyncWorkerThreadMain );
+
+	s_asyncInitialized = true;
+}
+
+static void EnqueueAsyncJobCommon( PendingAsyncJob&& job )
+{
+	EnsureAsyncWorkersStarted();
+	{
+		std::lock_guard<std::mutex> lock( s_pendingMutex );
+		s_pendingQueue.push_back( std::move( job ) );
+	}
+	s_pendingCV.notify_one();
+}
+
+#endif // HAVE_ASTCENC
+
+void ASTC_EnqueueAsyncCompress2D(
+	const void* textureIdentity,
+	unsigned int texName,
+	unsigned int target,
+	int mip,
+	const void* srcData,
+	size_t srcDataSize,
+	int width,
+	int height,
+	bool isDXT,
+	int dxtD3DFormat,
+	unsigned int srcGLFormat,
+	unsigned int srcGLType,
+	bool isHDR,
+	int blockW,
+	int blockH,
+	int qualityPreset )
+{
+#if !defined( HAVE_ASTCENC )
+	(void)textureIdentity; (void)texName; (void)target; (void)mip; (void)srcData; (void)srcDataSize;
+	(void)width; (void)height; (void)isDXT; (void)dxtD3DFormat; (void)srcGLFormat; (void)srcGLType;
+	(void)isHDR; (void)blockW; (void)blockH; (void)qualityPreset;
+	return;
+#else
+	if ( !srcData || srcDataSize == 0 )
+		return;
+	void* copy = malloc( srcDataSize );
+	if ( !copy )
+		return;
+	memcpy( copy, srcData, srcDataSize );
+
+	PendingAsyncJob job;
+	job.textureIdentity = textureIdentity;
+	job.texName = texName;
+	job.target = target;
+	job.mip = mip;
+	job.srcDataCopy = copy;
+	job.srcDataSize = srcDataSize;
+	job.width = width;
+	job.height = height;
+	job.isDXT = isDXT;
+	job.dxtD3DFormat = dxtD3DFormat;
+	job.srcGLFormat = srcGLFormat;
+	job.srcGLType = srcGLType;
+	job.isHDR = isHDR;
+	job.blockW = blockW;
+	job.blockH = blockH;
+	job.qualityPreset = qualityPreset;
+	job.enqueueTime = std::chrono::steady_clock::now();
+
+	EnqueueAsyncJobCommon( std::move( job ) );
+#endif
+}
+
+void ASTC_PumpCompletedAsyncJobs( int maxJobs )
+{
+#if !defined( HAVE_ASTCENC )
+	(void)maxJobs;
+	return;
+#else
+	for ( int i = 0; i < maxJobs; ++i )
+	{
+		CompletedAsyncJob job;
+		{
+			std::lock_guard<std::mutex> lock( s_completedMutex );
+			if ( s_completedQueue.empty() )
+				return;
+			job = std::move( s_completedQueue.front() );
+			s_completedQueue.pop_front();
+		}
+
+		// 2D only -- see ASTC_EnqueueAsyncCompress2D()'s header comment for
+		// why GL_TEXTURE_3D isn't included here.
+		GLint prevBinding = 0;
+		gGL->glGetIntegerv( GL_TEXTURE_BINDING_2D, &prevBinding );
+
+		gGL->glBindTexture( (GLenum)job.target, (GLuint)job.texName );
+		// Drain whatever the bind itself might have raised (e.g. texName no
+		// longer valid -- see the known-risk note in astc_texcompress.h)
+		// before it can leak into an unrelated glGetError() check elsewhere.
+		while ( gGL->glGetError() != GL_NO_ERROR ) {}
+
+		gGL->glCompressedTexImage2D( (GLenum)job.target, job.mip,
+									  (GLenum)job.result.m_glInternalFormat,
+									  job.width, job.height, 0,
+									  job.result.m_nDataSize, job.result.m_pData );
+		while ( gGL->glGetError() != GL_NO_ERROR ) {}	// see comment above the bind
+
+		gGL->glBindTexture( (GLenum)job.target, (GLuint)prevBinding );
+
+		ASTC_FreeResult( &job.result );
+	}
 #endif
 }
