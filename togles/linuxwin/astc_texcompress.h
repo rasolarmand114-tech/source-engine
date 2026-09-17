@@ -270,5 +270,92 @@ extern ConVar gl_astc_debug_disable;	// 0/1, default 0 -- debug-only kill switch
 extern ConVar gl_astc_block_ldr;		// "4x4" / "5x5" / "6x6" / "8x8" ... - block size used for LDR (8-bit) sources
 extern ConVar gl_astc_block_hdr;		// "4x4" / "5x5" / "6x6" / "8x8" ... - block size used for HDR (float) sources
 extern ConVar gl_astc_quality;			// 0-100 - encoder quality/speed tradeoff
+extern ConVar gl_astc_async;			// 0/1, default 1 -- compress on background threads instead of blocking the GL thread; 0 = old synchronous behavior (safe fallback if async ever misbehaves)
+extern ConVar gl_astc_async_workers;	// number of persistent background compress threads, default 2
+
+// ===========================================================================
+// Asynchronous compression.
+//
+// The synchronous ASTC_Compress*Cached() functions above are correct but
+// block the calling (GL) thread for the full duration of the encode. If
+// several textures need compressing within the same frame, their costs sum
+// on that one thread and can blow the frame budget even though each one
+// individually is fast. The functions below spread that cost across frames
+// instead: enqueue a job (cheap, returns immediately), the actual encode
+// runs on background worker threads, and applying the finished result to
+// the live GL texture happens later, piggybacked onto some later call to
+// CGLMTex::WriteTexels() (see ASTC_PumpCompletedAsyncJobs()) since that is
+// already guaranteed to run on the thread that owns the GL context.
+//
+// The upload of the ORIGINAL uncompressed/DXT data must still happen
+// immediately and unconditionally when using this path -- the texture has
+// to be correct and visible right away; ASTC replaces it silently once the
+// background job finishes, which can be anywhere from the same frame to a
+// few frames later depending on how busy the worker pool is.
+//
+// KNOWN RISK: a job captures the GL texture name via glGetIntegerv() at
+// enqueue time and re-binds that name when applying the result later. If
+// the texture is deleted and its GL name reused for a completely different
+// texture before the job is applied, the wrong texture would be
+// overwritten. This is mitigated (not eliminated) by dropping any job
+// older than kAsyncJobMaxAgeSeconds (see astc_texcompress.cpp) and by
+// applying completed jobs promptly (a small budget every WriteTexels call
+// rather than batching them up) -- but it is a real trade-off of doing this
+// without an engine hook into texture destruction. If this ever causes a
+// visible glitch (wrong texture content, more than a mip's worth), set
+// gl_astc_async to 0 to fall back to the old synchronous, safe behavior.
+// ===========================================================================
+
+// Enqueues a background compression job for a 2D texture and returns
+// immediately -- does not touch the GPU. Call this AFTER already uploading
+// srcData uncompressed/DXT via the normal glTexImage2D/glCompressedTexImage2D
+// path, right where ASTC_CompressTextureCached()/ASTC_CompressDXTToASTCCached()
+// used to be called synchronously. Makes its own copy of srcData, so the
+// caller's buffer can be freed or reused immediately after this returns.
+//   textureIdentity - the owning CGLMTex's `this`, for give-up tracking
+//   texName         - the currently-bound GL texture name (query it with
+//                     glGetIntegerv(GL_TEXTURE_BINDING_2D, ...) right before
+//                     calling this, while it's still guaranteed bound)
+//   isDXT           - true: srcData is DXT1/3/5 block data, dxtD3DFormat is used
+//                     false: srcData is raw pixels, srcGLFormat/srcGLType/isHDR are used
+//
+// 2D only, deliberately: applying a finished result later needs to replace
+// the texture's storage wholesale (glCompressedTexImage2D), which is fine
+// for a whole 2D texture but not for a single Z-layer of a volume texture
+// -- that would need glCompressedTexSubImage3D, which isn't reliably
+// supported for compressed formats across GPU drivers, on top of not being
+// confirmed available in this codebase's GL function table. GL_TEXTURE_3D
+// keeps using the synchronous ASTC_Compress*3DSliced() path (still gets the
+// content cache and multithreading, just not deferred across frames) --
+// 3D textures are far rarer than 2D, so this covers the actual reported
+// case (several ordinary textures bursting in one frame) without taking on
+// that additional, less-tested risk.
+void ASTC_EnqueueAsyncCompress2D(
+	const void* textureIdentity,
+	unsigned int texName,
+	unsigned int target,
+	int mip,
+	const void* srcData,
+	size_t srcDataSize,
+	int width,
+	int height,
+	bool isDXT,
+	int dxtD3DFormat,
+	unsigned int srcGLFormat,
+	unsigned int srcGLType,
+	bool isHDR,
+	int blockW,
+	int blockH,
+	int qualityPreset );
+
+// Applies up to maxJobs finished background compressions to their live GL
+// textures (glBindTexture + glCompressedTexImage2D, then restores
+// whatever was bound before). Call this once near the top of
+// CGLMTex::WriteTexels(), unconditionally, regardless of whether that
+// particular call needs ASTC itself -- it is how completed work from OTHER
+// textures actually reaches the GPU. Safe to call even if async is off or
+// nothing has finished; returns immediately in that case. Keep maxJobs
+// small (1-2) so this can never itself become a new source of frame spikes.
+void ASTC_PumpCompletedAsyncJobs( int maxJobs );
 
 #endif // ASTC_TEXCOMPRESS_H
