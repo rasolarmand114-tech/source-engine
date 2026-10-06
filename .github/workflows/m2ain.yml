@@ -6,7 +6,7 @@ on:
 jobs:
   builds-android:
     name: Build android-aarch64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout source (shallow clone)
